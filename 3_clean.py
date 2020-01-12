@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 from wtte import WTTE
 import matplotlib.pyplot as plt
+from scipy.special import gamma
 
 
 def to_date(df, cols):    
@@ -75,28 +76,11 @@ def clean(df):
     return df
 
 
-
 #########################################
-# Exec Pipeline part
-datapath = "data/"
-filename = "B0005.mat" + "_transformed.csv" + "_labeled.csv"
-
-df = load(datapath + filename)
-df = transform(df)
-df = clean(df)
-
-
-
-# Visualize
-charge = df[df["state"] == "charge"]
-discharge = df[df["state"] == "discharge"]
-df.groupby("state").count()["abs_time"].plot(kind="bar")
-
-
-#########################################
-# Prepare samples for training
+# Prepare for Training
 
 def sample(df, seq_len, sample_id=None):
+    # TODO currently does oversampling
     
     if sample_id:
         rand_idx = sample_id
@@ -115,21 +99,6 @@ def tte_to_float(df):
     df.loc[df.index, "y_tte"] = tte
     
     return df
-
-
-
-########################################
-# Features
-    
-loc = ["abs_time", "index", "Time", "state", "counter", "glob_time", "EOL", "tte"]
-blacklist = ["ambient_temperature"]
-features = [i for i in df.columns if i not in loc and i not in blacklist]
-labels = ["y_tte", "y_u"]
-
-# Uncensoring Label
-df.loc[:, "y_u"] = df["EOL"].max()
-df = df[df["tte"].dt.total_seconds() >= 0]   # crop measures later than event
-df = tte_to_float(df)
 
 
 def sample_df_to_tensor(sample, features, labels):
@@ -156,9 +125,76 @@ def stack_samples_to_tensor(samples, features, labels, seq_len):
     return np.array(X), np.array(Y)
 
 
-############################################
+#########################################
+# Learning
+
+def weib_pdf(x, k, lam):
+    return (k / lam * (x / lam)**(k-1)) * np.exp(-(x/lam)**k)
+
+def weib_mean(k, lam):
+    return lam * gamma(1+(1/k))
+
+def weib_mode(k, lam):
+    # k   = shape / b / beta
+    # lam = scale / a / alpha
+    return lam * ((k-1)/k)**(1/k)
+
+
+#####################################
+# Reporting
     
-# select features here
+def plot(row):
+    tte = row.loc["y_tte"]
+    u = row.loc["y_u"]
+    a = row.loc["a"]
+    b = row.loc["b"]
+    c = "r" if u == 1.0 else "g"
+    x = np.linspace(start=0, stop=int(tte+2), num=100)
+    
+    y = weib_pdf(x, b, a)
+    # wb_mean = weib_mean(b, a)
+    wb_mode = weib_mode(b, a)
+    
+    fig, ax = plt.subplots(1)
+    # ax.axvline(x=wb_mean, linestyle="--", c="b")
+    ax.axvline(x=wb_mode, linestyle="--", c="r")
+    ax.plot(x, y)
+    ax.plot(tte, 0.00001, marker="o", color=c)
+
+    return fig, ax
+
+
+#########################################
+# Exec
+datapath = "data/"
+filename = "B0005.mat" + "_transformed.csv" + "_labeled.csv"
+
+df = load(datapath + filename)
+df = transform(df)
+df = clean(df)
+
+
+# Visualize
+charge = df[df["state"] == "charge"]
+discharge = df[df["state"] == "discharge"]
+df.groupby("state").count()["abs_time"].plot(kind="bar")
+
+
+# Features
+loc = ["abs_time", "index", "Time", "state", "counter", "glob_time", "EOL", "tte"]
+blacklist = ["ambient_temperature"]
+features = [i for i in df.columns if i not in loc and i not in blacklist]
+labels = ["y_tte", "y_u"]
+
+
+# Uncensoring Label
+df.loc[:, "y_u"] = df["EOL"].max()
+df = df[df["tte"].dt.total_seconds() >= 0]   # crop measures later than event
+df = tte_to_float(df)
+
+
+##########################################
+# Configure
 features_ = [
     "Voltage_measured",
     # "Current_measured",
@@ -172,15 +208,15 @@ features_ = [
     ]
 
 
-t_x = 50
-x_n = len(features_)
-num_samples = 200
+t_x = 50               # Length of series
+x_n = len(features_)   # number of features
+num_samples = 200      # Samples to pick from data
 
 
-df = df[df["state"]=="charge"]
+df = df[df["state"]=="charge"]      # Train on state
 
-samples_tr = [sample(df, t_x) for i in range(num_samples)]
-samples_te = [sample(df, t_x) for i in range(num_samples)]
+samples_tr = [sample(df, t_x) for i in range(num_samples)]   # sampling
+samples_te = [sample(df, t_x) for i in range(num_samples)]   # sampling
 
 
 X_tr, Y_tr = stack_samples_to_tensor(samples_tr, features_, labels, t_x)
@@ -190,7 +226,6 @@ X_te, Y_te = stack_samples_to_tensor(samples_te, features_, labels, t_x)
 print("X_te:", X_te.shape, " Y_te:", Y_te.shape)
 
 
-# Build Model
 model = WTTE(t_x, n_features=x_n)
 model.compile_model()
 model.fit(X_tr, Y_tr, epochs=1000)
@@ -199,39 +234,54 @@ plt.plot(loss)
 
 y_pred = model.model.predict(X_te)
 report = pd.DataFrame(np.hstack((Y_te, y_pred)), columns=labels + ["a", "b"])
+report["weib_mode"] = weib_mode(report["b"], report["a"])
 
-from scipy.special import gamma
+# 
+# for i in range(report.index.values.max()):
+#     row = report.iloc[i]
+#     fig, ax = plot(row)
+#     plt.savefig(f"results/{i}.png")
+#     plt.close()
 
-def weib_pdf(x, k, lam):
-    return (k / lam * (x / lam)**(k-1)) * np.exp(-(x/lam)**k)
+#################################
+# Scoring
+# RUL using Heaviside Step Function
 
-def weib_mean(k, lam):
-    return lam * gamma(1+(1/k))
+# Zwischenergebnis (for verification)
+report["heavi"] = np.heaviside(report["y_tte"] - report["weib_mode"], 0)
+print("Plain Heaviside-Score:", report["heavi"].sum() / len(report))
 
-def plot(row):
-    tte = row.loc["y_tte"]
-    u = row.loc["y_u"]
-    a = row.loc["a"]
-    b = row.loc["b"]
-    c = "r" if u == 1.0 else "g"
-    x = np.linspace(start=0, stop=int(tte+2), num=100)
+def score_rul(y, y_pred):
     
-    y = weib_pdf(x, b, a)
-    wb_mean = weib_mean(b, a)
+    term1 = np.heaviside(y - y_pred, 0) * (np.exp((y - y_pred) / 13) - 1)  # term activated on early predictions
+    term2 = np.heaviside(y_pred - y, 0) * (np.exp((y - y_pred) / 10) - 1)  # term activated on too late predictions
+    score_ = term1 + term2
     
-    fig, ax = plt.subplots(1)
-    ax.axvline(x=wb_mean, linestyle="--")
-    ax.plot(x, y)
-    ax.plot(tte, 0.00001, marker="o", color=c)
-
-    return fig, ax
+    return score_
 
 
-for i in range(report.index.values.max()):
-    row = report.iloc[i]
-    fig, ax = plot(row)
-    plt.savefig(f"results/{i}.png")
-    plt.close()
+report["rul_score"] = score_rul(report["y_tte"], report["weib_mode"])
+print("Remaining Useful Time (RUL) Score:", report["rul_score"].sum() / len(report))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
